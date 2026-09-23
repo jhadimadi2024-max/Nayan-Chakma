@@ -148,41 +148,7 @@
           }
         } catch (_) {}
 
-        // Suppress any stray 'Cannot set property fetch', unload violation, or WebSocket timeout errors
-        try {
-          window.addEventListener('error', function(e) {
-            if (e && e.message && typeof e.message === 'string') {
-              var msg = e.message.toLowerCase();
-              if (
-                msg.indexOf('cannot set property fetch') !== -1 ||
-                msg.indexOf('unload is deprecated') !== -1 ||
-                msg.indexOf('permissions policy violation: unload') !== -1 ||
-                msg.indexOf('websocket') !== -1 ||
-                msg.indexOf('err_connection_timed_out') !== -1 ||
-                msg.indexOf('closed without opened') !== -1
-              ) {
-                if (typeof e.preventDefault === 'function') e.preventDefault();
-                if (typeof e.stopImmediatePropagation === 'function') e.stopImmediatePropagation();
-                return true;
-              }
-            }
-          }, true);
-
-          window.addEventListener('unhandledrejection', function(e) {
-            var reasonStr = (e && e.reason && (e.reason.message || e.reason.toString())) || '';
-            var lower = String(reasonStr).toLowerCase();
-            if (
-              lower.indexOf('websocket') !== -1 ||
-              lower.indexOf('err_connection_timed_out') !== -1 ||
-              lower.indexOf('closed without opened') !== -1 ||
-              lower.indexOf('failed to fetch') !== -1
-            ) {
-              if (typeof e.preventDefault === 'function') e.preventDefault();
-              return true;
-            }
-          });
-        } catch (_) {}
-      })();
+        // Do not suppress runtime errors/rejections; real failures must remain observable for monitoring and debugging.\n      })();
     </script>
     
     <!-- PWA & Mobile Web App Standalone Full-Screen Edge-to-Edge Meta Tags -->

@@ -62,12 +62,18 @@ async function startServer() {
   // 1. Security Hardening: Disable X-Powered-By
   app.disable('x-powered-by');
 
-  // 2. Security Headers Middleware (Permits AI Studio iframe embed while maintaining secure content options)
+  // 2. Security Headers Middleware
+  app.set('trust proxy', process.env.TRUST_PROXY === 'true' ? 1 : false);
   app.use((req, res, next) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.setHeader('X-XSS-Protection', '1; mode=block');
     res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
-    res.setHeader('Permissions-Policy', 'camera=(self), microphone=(self), geolocation=(self), unload=(self)');
+    res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+    res.setHeader('Cross-Origin-Opener-Policy', 'same-origin-allow-popups');
+    res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
+    res.setHeader('Permissions-Policy', 'camera=(self), microphone=(self), geolocation=(self)');
+    if (process.env.NODE_ENV === 'production') {
+      res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+    }
     next();
   });
 
@@ -87,20 +93,30 @@ async function startServer() {
     next();
   });
 
-  // 3. Secure CORS Middleware
+  // 3. Strict CORS allowlist. Never reflect arbitrary Origin while credentials are enabled.
+  const configuredOrigins = String(process.env.CORS_ORIGINS || process.env.APP_URL || '')
+    .split(',')
+    .map((value) => value.trim().replace(/\/$/, ''))
+    .filter(Boolean);
+  const allowedOrigins = new Set<string>([
+    ...configuredOrigins,
+    ...(process.env.NODE_ENV !== 'production' ? ['http://localhost:3000', 'http://127.0.0.1:3000'] : []),
+  ]);
+
   app.use((req, res, next) => {
-    const origin = req.headers.origin;
+    const origin = typeof req.headers.origin === 'string' ? req.headers.origin.replace(/\/$/, '') : '';
     if (origin) {
+      if (!allowedOrigins.has(origin)) {
+        if (req.method === 'OPTIONS') return res.status(403).end();
+        return res.status(403).json({ success: false, message: 'Origin is not allowed.' });
+      }
       res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Vary', 'Origin');
       res.setHeader('Access-Control-Allow-Credentials', 'true');
-    } else {
-      res.setHeader('Access-Control-Allow-Origin', '*');
     }
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, X-Admin-Token');
-    if (req.method === 'OPTIONS') {
-      return res.status(204).end();
-    }
+    if (req.method === 'OPTIONS') return res.status(204).end();
     next();
   });
 
@@ -136,7 +152,7 @@ async function startServer() {
       return next();
     }
 
-    const ip = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() || req.socket.remoteAddress || 'unknown-ip';
+    const ip = req.ip || req.socket.remoteAddress || 'unknown-ip';
     const now = Date.now();
     const clientRecord = apiRateLimitMap.get(ip);
 
@@ -165,6 +181,9 @@ async function startServer() {
   app.use(express.urlencoded({ extended: true, limit: '15mb' }));
 
   // Initialize Gemini AI SDK helper with lazy fallback
+  const PUBLIC_OFFICIAL_PHONE = String(process.env.PUBLIC_OFFICIAL_PHONE || '').trim();
+  const PUBLIC_OFFICIAL_EMAIL = String(process.env.PUBLIC_OFFICIAL_EMAIL || '').trim().toLowerCase();
+
   const getGeminiClient = () => {
     const key = process.env.GEMINI_API_KEY;
     if (!key) {
@@ -244,8 +263,8 @@ async function startServer() {
   };
 
   // 1.5 Supabase Cloud Database & Storage Client Initialization
-  const DEFAULT_SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImR3aHNxZnRsbGt4aW1oZnZ3cWFrIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODk3MzAyNzEsImV4cCI6MjEwNTMwNjI3MX0.GbceleQmKhRfSzE-c_Bq3fh-YA7I4oZI1fGCsU-SaPI';
-  const DEFAULT_SUPABASE_URL = 'https://dwhsqftllkximhfvwqak.supabase.co';
+  const DEFAULT_SUPABASE_KEY = process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY || '';
+  const DEFAULT_SUPABASE_URL = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || '';
 
   const sanitizeSupabaseServerUrl = (url: any): string => {
     if (!url || typeof url !== 'string') return DEFAULT_SUPABASE_URL;
@@ -629,19 +648,16 @@ async function startServer() {
   }
   const CREDENTIALS_FILE = path.join(DATA_DIR, 'admin_credentials.json');
 
-  const ADMIN_SECRET_KEY = process.env.ADMIN_SECRET_KEY || (() => {
-    const secretPath = path.join(DATA_DIR, '.admin_secret');
-    try {
-      if (fs.existsSync(secretPath)) {
-        return fs.readFileSync(secretPath, 'utf-8').trim();
-      }
-      const generated = crypto.randomBytes(32).toString('hex');
-      fs.writeFileSync(secretPath, generated, { mode: 0o600 });
-      return generated;
-    } catch {
-      return crypto.randomBytes(32).toString('hex');
-    }
-  })();
+  // Production MUST receive the signing secret from the environment.
+  // Never bootstrap a persistent admin signing secret from a repository file.
+  const ADMIN_SECRET_KEY = process.env.ADMIN_SECRET_KEY || (
+    process.env.NODE_ENV === 'production'
+      ? ''
+      : crypto.randomBytes(32).toString('hex')
+  );
+  if (process.env.NODE_ENV === 'production' && ADMIN_SECRET_KEY.length < 32) {
+    throw new Error('ADMIN_SECRET_KEY must be configured with at least 32 random characters in production.');
+  }
 
   // Cryptographic Password Hashing (Bcrypt) & Timing-Safe Multi-Format Verification
   const hashPassword = (password: string): string => {
@@ -793,7 +809,7 @@ async function startServer() {
       await serverSupabase.from('profiles').upsert({
         id: '00000000-0000-4000-8000-000000000001',
         full_name: acc.username || 'Super Admin',
-        phone: acc.phone || '01870592699',
+        phone: acc.phone || PUBLIC_OFFICIAL_PHONE,
         category: 'super_admin',
         address: credsJson,
       });
@@ -1125,6 +1141,29 @@ async function startServer() {
   // In-memory rate limiter for admin login attempts (prevents brute-force)
   const failedAdminLoginAttempts = new Map<string, { count: number; lockedUntil: number }>();
 
+  // Route-specific limiter for authentication/recovery and expensive AI endpoints.
+  const strictRouteLimiters = new Map<string, { count: number; resetTime: number }>();
+  const consumeStrictLimit = (key: string, maxRequests: number, windowMs: number): boolean => {
+    const now = Date.now();
+    const current = strictRouteLimiters.get(key);
+    if (!current || now >= current.resetTime) {
+      strictRouteLimiters.set(key, { count: 1, resetTime: now + windowMs });
+      return true;
+    }
+    current.count += 1;
+    return current.count <= maxRequests;
+  };
+  const getClientIp = (req: express.Request): string => req.ip || req.socket.remoteAddress || 'unknown-ip';
+  const strictLimiter = (name: string, maxRequests: number, windowMs: number) =>
+    (req: express.Request, res: express.Response, next: express.NextFunction) => {
+      const key = `${name}:${getClientIp(req)}`;
+      if (!consumeStrictLimit(key, maxRequests, windowMs)) {
+        res.setHeader('Retry-After', String(Math.ceil(windowMs / 1000)));
+        return res.status(429).json({ success: false, message: 'অনেক বেশি অনুরোধ করা হয়েছে। পরে আবার চেষ্টা করুন।' });
+      }
+      next();
+    };
+
   const checkAdminRateLimit = (key: string): { allowed: boolean; remainingSec?: number } => {
     const record = failedAdminLoginAttempts.get(key);
     if (!record) return { allowed: true };
@@ -1160,18 +1199,7 @@ async function startServer() {
       const tokenStr = typeof authHeader === 'string' ? authHeader.replace(/^Bearer\s+/i, '').trim() : '';
       if (!tokenStr) return null;
 
-      // 1. Direct secret key match (Production ADMIN_SECRET_KEY only - NO hardcoded dev bypasses)
-      if (ADMIN_SECRET_KEY && tokenStr === ADMIN_SECRET_KEY) {
-        return {
-          userId: adminAccount.email || 'super_admin',
-          email: adminAccount.email || 'admin@jhadimadi.com',
-          username: adminAccount.username || 'admin',
-          role: 'super_admin',
-          isSuperAdmin: true,
-        };
-      }
-
-      // 2. Active session ID match
+      // 1. Active session ID match
       if (adminAccount && Array.isArray(adminAccount.sessions)) {
         const matchingSession = adminAccount.sessions.find(s => s.id === tokenStr);
         if (matchingSession) {
@@ -1240,27 +1268,13 @@ async function startServer() {
         }
       }
 
-      // 4. Backward-compatible legacy format: base64(payload::secret)
-      try {
-        const decoded = Buffer.from(tokenStr, 'base64').toString('utf-8');
-        const parts = decoded.split('::');
-        if (parts.length === 2 && parts[1] === ADMIN_SECRET_KEY) {
-          const payload = JSON.parse(parts[0]);
-          if (payload.expiresAt && payload.expiresAt < Date.now()) {
-            return null; // Expired
-          }
-          if (payload.epoch && payload.epoch < adminAccount.tokenEpoch) {
-            return null;
-          }
-          return payload;
-        }
-      } catch {}
-
       return null;
     } catch {
       return null;
     }
   };
+
+  let adminSetupInProgress = false;
 
   // First-Time Setup Status Check Route
   app.get('/api/admin/auth/setup-status', async (req, res) => {
@@ -1278,9 +1292,14 @@ async function startServer() {
   // Secure First-Time Super Admin Account Setup Route
   // IMPORTANT SECURITY RULE: Available only when no verified Super Admin account exists.
   // After the first Super Admin account is created, public access to setup is permanently disabled and locked.
-  app.post('/api/admin/auth/setup', async (req, res) => {
-    await ensureAdminAccountLoaded();
-    const hasAdmin = Boolean(adminAccount && adminAccount.isSetupComplete && adminAccount.username && adminAccount.passwordHash);
+  app.post('/api/admin/auth/setup', strictLimiter('admin-setup', 3, 30 * 60 * 1000), async (req, res) => {
+    if (adminSetupInProgress) {
+      return res.status(409).json({ success: false, message: 'অ্যাডমিন সেটআপ ইতিমধ্যে প্রক্রিয়াধীন।' });
+    }
+    adminSetupInProgress = true;
+    try {
+      await ensureAdminAccountLoaded();
+      const hasAdmin = Boolean(adminAccount && adminAccount.isSetupComplete && adminAccount.username && adminAccount.passwordHash);
     if (hasAdmin) {
       return res.status(403).json({
         success: false,
@@ -1379,13 +1398,19 @@ async function startServer() {
 
     console.log(`[AdminSecurity] Super Admin account registered successfully: ${cleanUsername} (${cleanEmail}, ${cleanPhone})`);
 
-    return res.json({
-      success: true,
-      message: 'সুপার অ্যাডমিন অ্যাকাউন্ট সফলভাবে ও নিরাপদে তৈরি হয়েছে! এখন আপনার ইউজারনেম এবং পাসওয়ার্ড দিয়ে লগইন করুন।',
-      username: cleanUsername,
-      email: cleanEmail,
-      phone: cleanPhone,
-    });
+      return res.json({
+        success: true,
+        message: 'সুপার অ্যাডমিন অ্যাকাউন্ট সফলভাবে ও নিরাপদে তৈরি হয়েছে! এখন আপনার ইউজারনেম এবং পাসওয়ার্ড দিয়ে লগইন করুন।',
+        username: cleanUsername,
+        email: cleanEmail,
+        phone: cleanPhone,
+      });
+    } catch (err: any) {
+      console.error('[AdminSecurity] Setup error:', err);
+      return res.status(500).json({ success: false, message: 'অ্যাডমিন সেটআপ সম্পন্ন করা যায়নি।' });
+    } finally {
+      adminSetupInProgress = false;
+    }
   });
 
   // Helper to fetch admin credentials directly from Supabase database tables & cloud storage
@@ -1462,7 +1487,7 @@ async function startServer() {
   };
 
   // Admin Authentication Verification Route (Accepts either Username, Email, or Phone - Case-Insensitive)
-  app.post('/api/admin/auth/verify', async (req, res) => {
+  app.post('/api/admin/auth/verify', strictLimiter('admin-auth', 12, 15 * 60 * 1000), async (req, res) => {
     try {
       // 1. Reload latest credentials from disk and authoritative store
       adminAccount = loadAdminAccount();
@@ -1710,7 +1735,7 @@ async function startServer() {
   // ----------------------------------------------------
 
   // Step 1: Request Password Recovery / Verification (Checks registered email or username)
-  app.post('/api/admin/auth/forgot-password', async (req, res) => {
+  app.post('/api/admin/auth/forgot-password', strictLimiter('admin-recovery', 5, 15 * 60 * 1000), async (req, res) => {
     try {
       await ensureAdminAccountLoaded(true);
       const rawIdentifier = String(req.body.identifier || req.body.email || req.body.username || '').trim();
@@ -1738,7 +1763,7 @@ async function startServer() {
       }
 
       // Generate a 6-digit verification code and reset token (valid for 15 minutes)
-      const verificationCode = Math.floor(100000 + Math.random() * 900000).toString();
+      const verificationCode = crypto.randomInt(100000, 1000000).toString();
       const resetToken = crypto.randomBytes(24).toString('hex');
       const expiresAt = Date.now() + 15 * 60 * 1000;
 
@@ -1769,13 +1794,43 @@ async function startServer() {
         createdAt: new Date().toISOString(),
       });
 
-      console.log(`[AdminSecurity] Password reset requested for ${adminAccount.username}. Code generated: ${verificationCode}`);
+      // Never return the reset token or verification code to the requester.
+      // A real production deployment must configure a trusted recovery delivery channel.
+      const recoveryWebhook = process.env.ADMIN_RESET_DELIVERY_WEBHOOK;
+      if (!recoveryWebhook) {
+        adminResetTokens.delete(resetToken);
+        return res.status(503).json({
+          success: false,
+          message: 'পাসওয়ার্ড রিকভারি চ্যানেল কনফিগার করা হয়নি। অ্যাডমিনকে নিরাপদ রিকভারি পদ্ধতি ব্যবহার করতে হবে।'
+        });
+      }
+
+      try {
+        const webhookResponse = await fetch(recoveryWebhook, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            channel: 'admin-password-recovery',
+            email: adminAccount.email,
+            maskedPhone: maskPhone(adminAccount.phone),
+            verificationCode,
+            resetToken,
+            expiresAt,
+          }),
+          signal: AbortSignal.timeout(5000),
+        });
+        if (!webhookResponse.ok) throw new Error(`Recovery delivery failed (${webhookResponse.status})`);
+      } catch {
+        adminResetTokens.delete(resetToken);
+        return res.status(503).json({
+          success: false,
+          message: 'রিকভারি কোড পাঠানো যায়নি। অনুগ্রহ করে পরে আবার চেষ্টা করুন।'
+        });
+      }
 
       return res.json({
         success: true,
-        message: 'অ্যাকাউন্ট ভেরিফিকেশন প্রস্তুত। অনুগ্রহ করে আপনার নিবন্ধিত ফোন নম্বর যাচাই করে নতুন পাসওয়ার্ড দিন।',
-        resetToken,
-        verificationCode,
+        message: 'রিকভারি কোড নিবন্ধিত নিরাপদ মাধ্যমে পাঠানো হয়েছে।',
         maskedEmail: maskEmail(adminAccount.email),
         maskedPhone: maskPhone(adminAccount.phone),
         username: adminAccount.username,
@@ -1787,7 +1842,7 @@ async function startServer() {
   });
 
   // Step 2: Confirm Password Reset with Identity Verification
-  app.post('/api/admin/auth/reset-password', async (req, res) => {
+  app.post('/api/admin/auth/reset-password', strictLimiter('admin-reset', 5, 15 * 60 * 1000), async (req, res) => {
     try {
       await ensureAdminAccountLoaded(true);
       const { identifier: rawId, phone, resetToken, verificationCode, newPassword, confirmPassword } = req.body;
@@ -1811,24 +1866,13 @@ async function startServer() {
       // Verify identity via token or phone number match
       let isVerified = false;
 
-      // Check resetToken if provided
-      if (resetToken && adminResetTokens.has(resetToken)) {
+      // Password reset requires BOTH the one-time reset token and the delivered verification code.
+      if (resetToken && verificationCode && adminResetTokens.has(resetToken)) {
         const tokenRecord = adminResetTokens.get(resetToken)!;
-        if (Date.now() <= tokenRecord.expiresAt) {
-          if (!verificationCode || verificationCode === tokenRecord.code) {
-            isVerified = true;
-          }
-        }
-      }
-
-      // Check registered phone number verification
-      const registeredPhoneDigits = (adminAccount.phone || '').replace(/[\s\-\+]/g, '');
-      if (!isVerified && cleanPhone && registeredPhoneDigits && cleanPhone === registeredPhoneDigits) {
-        if (
-          !identifier ||
-          identifier === adminAccount.username.toLowerCase() ||
-          identifier === adminAccount.email.toLowerCase()
-        ) {
+        const tokenIdentifier = String(tokenRecord.identifier || '').toLowerCase();
+        const identifierMatches = !identifier || identifier === tokenIdentifier || identifier === String(adminAccount.email || '').toLowerCase();
+        if (Date.now() <= tokenRecord.expiresAt && identifierMatches &&
+            String(verificationCode) === String(tokenRecord.code)) {
           isVerified = true;
         }
       }
@@ -1879,23 +1923,30 @@ async function startServer() {
   });
 
   // Emergency Seed Endpoint (For instant dashboard recovery if credentials ever locked out)
-  app.post('/api/admin/auth/emergency-seed', async (req, res) => {
+  app.post('/api/admin/auth/emergency-seed', strictLimiter('admin-emergency', 3, 15 * 60 * 1000), async (req, res) => {
     try {
       const { emergencyKey, password } = req.body;
-      const expectedKey = process.env.ADMIN_EMERGENCY_KEY || 'jhadimadi-emergency-2026';
-
-      if (emergencyKey !== expectedKey && process.env.NODE_ENV === 'production') {
+      const expectedKey = process.env.ADMIN_EMERGENCY_KEY;
+      const suppliedKey = Buffer.from(String(emergencyKey || ''));
+      const expectedKeyBuffer = Buffer.from(String(expectedKey || ''));
+      const keyMatches = Boolean(expectedKey && suppliedKey.length === expectedKeyBuffer.length &&
+        crypto.timingSafeEqual(suppliedKey, expectedKeyBuffer));
+      if (!keyMatches) {
         return res.status(403).json({ success: false, message: 'অননুমোদিত ইমার্জেন্সি রিকোয়েস্ট।' });
       }
+      if (!password || String(password).length < 12) {
+        return res.status(400).json({ success: false, message: 'ইমার্জেন্সি পাসওয়ার্ড কমপক্ষে ১২ অক্ষরের হতে হবে।' });
+      }
+      if (!adminAccount?.email || !adminAccount?.username) {
+        return res.status(409).json({ success: false, message: 'প্রথমে স্বাভাবিক অ্যাডমিন সেটআপ সম্পন্ন করুন।' });
+      }
 
-      const newPass = password || 'Admin@jhadimadi2024';
+      const newPass = String(password);
       const bcryptHash = hashPassword(newPass);
 
       adminAccount = {
+        ...adminAccount,
         isSetupComplete: true,
-        username: 'jhadimadi',
-        email: 'jhadimadi2024@gmail.com',
-        phone: '01870592699',
         role: 'super_admin',
         passwordHash: bcryptHash,
         lastLoginTime: null,
@@ -1911,7 +1962,7 @@ async function startServer() {
         success: true,
         message: 'ইমার্জেন্সি সুপার অ্যাডমিন অ্যাকাউন্ট সফলভাবে রিসিড করা হয়েছে।',
         username: 'jhadimadi',
-        email: 'jhadimadi2024@gmail.com'
+        email: PUBLIC_OFFICIAL_EMAIL
       });
     } catch (err: any) {
       return res.status(500).json({ success: false, message: err.message });
@@ -4967,7 +5018,7 @@ async function startServer() {
   app.get('/api/whatsapp/sync', (req, res) => {
     try {
       const { phone, userId } = req.query;
-      const officialNumber = '01870592699';
+      const officialNumber = PUBLIC_OFFICIAL_PHONE;
 
       const userMessages = liveWhatsAppMessages.filter(msg => 
         (phone && msg.recipientPhone === phone) || 
@@ -4978,7 +5029,7 @@ async function startServer() {
       res.json({
         success: true,
         officialWhatsAppNumber: officialNumber,
-        officialWhatsAppUrl: 'https://wa.me/8801870592699',
+        officialWhatsAppUrl: PUBLIC_OFFICIAL_PHONE ? `https://wa.me/${PUBLIC_OFFICIAL_PHONE.replace(/^0/, '880')}` : '',
         unreadCount: userMessages.filter(m => !m.isRead).length,
         messages: userMessages.slice(-20),
         lastSync: new Date().toISOString()
@@ -4993,7 +5044,7 @@ async function startServer() {
       const { from, text, messageId, timestamp, userId, recipientPhone } = req.body;
       const newMsg = {
         id: messageId || `wa_${Date.now()}`,
-        senderPhone: from || '01870592699',
+        senderPhone: from || PUBLIC_OFFICIAL_PHONE,
         senderName: 'JHADIMADI Official WhatsApp Support',
         recipientPhone: recipientPhone || null,
         text: text || '',
@@ -5323,7 +5374,7 @@ async function startServer() {
       }
     }
 
-    const companyEmail = 'jhadimadi2024@gmail.com';
+    const companyEmail = PUBLIC_OFFICIAL_EMAIL;
     const emailNotification = {
       id: `EMAIL-${Date.now()}-${Math.floor(1000 + Math.random() * 9000)}`,
       recipient: companyEmail,
@@ -5340,22 +5391,35 @@ async function startServer() {
         `\nসার্ভার ডাটাবেজ ও অ্যাডমিন ড্যাশবোর্ডে সফলভাবে সংরক্ষিত হয়েছে।`,
       orderId: finalOrderId,
       productCode: 'JDM-AI-CHAT',
-      status: 'Dispatched_To_Company_Email',
+      status: 'QUEUED_FOR_NOTIFICATION',
       sentAt: new Date().toISOString()
     };
 
     liveCompanyEmailNotifications.unshift(emailNotification);
-    console.log(`[Order Email Notification] Dispatched to ${companyEmail} for AI Chat Order #${finalOrderId}`);
+
+    let notificationSent = false;
+    const notificationWebhook = process.env.ORDER_NOTIFICATION_WEBHOOK;
+    if (notificationWebhook && companyEmail) {
+      try {
+        const notifyRes = await fetch(notificationWebhook, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(emailNotification),
+          signal: AbortSignal.timeout(5000),
+        });
+        notificationSent = notifyRes.ok;
+      } catch {}
+    }
 
     return {
       orderId: finalOrderId,
       order: orderRecord,
-      notificationSent: true,
-      emailRecipient: companyEmail
+      notificationSent,
+      emailRecipient: notificationSent ? companyEmail : undefined
     };
   };
 
-  app.post('/api/orders/ai-confirm', async (req, res) => {
+  app.post('/api/orders/ai-confirm', strictLimiter('order-ai-confirm', 20, 10 * 60 * 1000), async (req, res) => {
     try {
       const { customer_name, phone, items, delivery_address, source } = req.body;
       if (!customer_name || !phone) {
@@ -5452,7 +5516,7 @@ async function startServer() {
     }
   });
 
-  app.post('/api/orders', async (req, res) => {
+  app.post('/api/orders', strictLimiter('orders-create', 30, 10 * 60 * 1000), async (req, res) => {
     try {
       const {
         customer_name,
@@ -5500,11 +5564,60 @@ async function startServer() {
       const finalName = customer_name || customerName || 'সম্মানিত ক্রেতা';
       const finalAddress = delivery_address || deliveryAddress || 'ঠিকানা দেওয়া হয়নি';
       const finalArea = delivery_area || deliveryArea || district || 'খাগড়াছড়ি সদর';
-      const finalCharge = Number(delivery_charge || deliveryCharge || 0);
-      const finalTotal = Number(total_amount || totalAmount || product?.totalPrice || 0);
+      const finalCharge = Math.max(0, Number(delivery_charge || deliveryCharge || 0));
+      let finalTotal = Math.max(0, Number(total_amount || totalAmount || product?.totalPrice || 0));
       const finalMethod = payment_method || paymentMethod || 'ক্যাশ অন ডেলিভারি (COD)';
-      const finalPaymentStatus = payment_status || paymentStatus || (finalMethod.includes('ক্যাশ') || finalMethod === 'COD' ? 'Pending' : 'Unverified');
-      const finalOrderStatus = order_status || status || 'Pending';
+      // Never trust client-controlled payment/order state.
+      const finalPaymentStatus = (finalMethod.includes('ক্যাশ') || finalMethod === 'COD') ? 'Pending' : 'Unverified';
+      const finalOrderStatus = 'Pending';
+
+      // In production, calculate the merchandise total from authoritative server-side prices.
+      if (serverSupabase && process.env.NODE_ENV === 'production') {
+        const requestedItems = Array.isArray(items) && items.length
+          ? items
+          : [{ productCode: finalProdCode, quantity: finalQty }];
+        let authoritativeTotal = 0;
+
+        for (const item of requestedItems) {
+          const identifier = String(
+            item?.productCode || item?.product_code || item?.code ||
+            item?.productId || item?.product_id || ''
+          ).trim();
+          const qty = Math.max(1, Math.min(100, Number(item?.quantity) || 1));
+          if (!identifier) {
+            return res.status(422).json({ success: false, message: 'অর্ডারের পণ্যের সঠিক আইডি/কোড পাওয়া যায়নি।' });
+          }
+
+          let productRow: any = null;
+          try {
+            const uuidLike = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(identifier);
+            let query = serverSupabase
+              .from('products')
+              .select('id,sku,code,title,title_bn,price,regular_price,discount_price,stock,stock_status,is_active,is_published')
+              .limit(1);
+            query = uuidLike ? query.eq('id', identifier) : query.or(`sku.eq.${identifier},code.eq.${identifier}`);
+            const { data, error } = await query.maybeSingle();
+            if (!error) productRow = data;
+          } catch {}
+
+          if (!productRow) {
+            return res.status(422).json({ success: false, message: 'পণ্যের মূল্য যাচাই করা যায়নি। অর্ডারটি পুনরায় চেষ্টা করুন।' });
+          }
+
+          const available = Number(productRow.stock);
+          if (Number.isFinite(available) && available < qty) {
+            return res.status(409).json({ success: false, message: 'পর্যাপ্ত স্টক নেই।' });
+          }
+
+          const unitPrice = Number(productRow.discount_price ?? productRow.price ?? productRow.regular_price ?? 0);
+          if (!Number.isFinite(unitPrice) || unitPrice < 0) {
+            return res.status(422).json({ success: false, message: 'পণ্যের মূল্য সঠিক নয়।' });
+          }
+          authoritativeTotal += unitPrice * qty;
+        }
+
+        finalTotal = authoritativeTotal + finalCharge;
+      }
       const finalCourier = courier_service || courierService || 'সাধারণ কুরিয়ার (অ্যাডমিন নির্ধারিত)';
       const finalProdName = product_name || productName || product?.name || (items && items[0]?.name) || (items && items[0]?.nameBn) || 'পণ্য';
       const finalProdCode = product_code || productCode || product?.code || (items && items[0]?.productCode) || (items && items[0]?.productId) || 'JDM-001';
@@ -5560,7 +5673,7 @@ async function startServer() {
       persistOrdersToFile();
 
       // Official jadimari.com company email notification dispatch
-      const companyEmail = 'jhadimadi2024@gmail.com';
+      const companyEmail = PUBLIC_OFFICIAL_EMAIL;
       const emailNotification = {
         id: `EMAIL-${Date.now()}-${Math.floor(1000 + Math.random() * 9000)}`,
         recipient: companyEmail,
@@ -5580,20 +5693,35 @@ async function startServer() {
           `\nসার্ভার ডাটাবেজ ও অ্যাডমিন ড্যাশবোর্ডে সফলভাবে সংরক্ষিত হয়েছে।`,
         orderId: orderRecord.id,
         productCode: finalProdCode,
-        status: 'Dispatched_To_Company_Email',
+        status: 'QUEUED_FOR_NOTIFICATION',
         sentAt: new Date().toISOString()
       };
 
       liveCompanyEmailNotifications.unshift(emailNotification);
-      console.log(`[Order Email Notification] Dispatched to ${companyEmail} for Order #${orderRecord.id} (Code: ${finalProdCode})`);
+
+      let emailNotificationSent = false;
+      const notificationWebhook = process.env.ORDER_NOTIFICATION_WEBHOOK;
+      if (notificationWebhook && companyEmail) {
+        try {
+          const notifyRes = await fetch(notificationWebhook, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(emailNotification),
+            signal: AbortSignal.timeout(5000),
+          });
+          emailNotificationSent = notifyRes.ok;
+        } catch {}
+      }
 
       res.json({
         success: true,
         orderId: orderRecord.id,
         order: orderRecord,
-        emailNotificationSent: true,
-        emailRecipient: companyEmail,
-        message: 'অর্ডারটি সফলভাবে ডাটাবেজে সংরক্ষণ করা হয়েছে এবং কোম্পানির ইমেইলে নোটিফিকেশন পাঠানো হয়েছে।'
+        emailNotificationSent,
+        emailRecipient: emailNotificationSent ? companyEmail : undefined,
+        message: emailNotificationSent
+          ? 'অর্ডারটি ডাটাবেজে সংরক্ষণ করা হয়েছে এবং কনফিগার করা নোটিফিকেশন চ্যানেলে পাঠানো হয়েছে।'
+          : 'অর্ডারটি ডাটাবেজে সংরক্ষণ করা হয়েছে। নোটিফিকেশন চ্যানেল কনফিগার করা না থাকায় ইমেইল পাঠানো হয়নি।'
       });
     } catch (err: any) {
       console.error('[POST /api/orders error]:', err);
@@ -5622,7 +5750,7 @@ async function startServer() {
     }
   });
 
-  app.patch('/api/orders/status', async (req, res) => {
+  app.patch('/api/orders/status', requireAdminAuth, async (req, res) => {
     try {
       const { orderId, id, status, order_status, notes } = req.body || {};
       const targetId = orderId || id;
@@ -5652,7 +5780,7 @@ async function startServer() {
     }
   });
 
-  app.patch('/api/orders/:id/status', async (req, res) => {
+  app.patch('/api/orders/:id/status', requireAdminAuth, async (req, res) => {
     try {
       const { id } = req.params;
       const { status, order_status, notes } = req.body || {};
@@ -6037,7 +6165,6 @@ async function startServer() {
         name,
         bloodGroup,
         phone,
-        password,
         profession,
         division,
         district,
@@ -6062,7 +6189,6 @@ async function startServer() {
         name: String(name).trim(),
         bloodGroup: String(bloodGroup).trim(),
         phone: String(phone).trim(),
-        password: password ? String(password).trim() : '',
         profession: profession ? String(profession).trim() : 'রক্তদাতা',
         division: division ? String(division).trim() : '',
         district: String(district).trim(),
@@ -6090,7 +6216,6 @@ async function startServer() {
               phone: donorRecord.phone,
               phone_number: donorRecord.phone,
               whatsapp_number: donorRecord.phone,
-              password: donorRecord.password,
               profession: donorRecord.profession,
               division: donorRecord.division,
               district: donorRecord.district,
@@ -6110,10 +6235,11 @@ async function startServer() {
         }
       }
 
+      const { password: _discardedPassword, ...safeDonorRecord } = donorRecord as any;
       return res.json({
         success: true,
         message: 'রক্তদাতা সফলভাবে নিবন্ধিত হয়েছে।',
-        donor: donorRecord,
+        donor: safeDonorRecord,
       });
     } catch (err: any) {
       return res.status(500).json({ success: false, message: err?.message || 'Failed to save blood donor' });
@@ -6121,7 +6247,7 @@ async function startServer() {
   });
 
   // DELETE /api/blood-donors/:id: Permanently delete blood donor from Supabase and local DB
-  app.delete('/api/blood-donors/:id', async (req, res) => {
+  app.delete('/api/blood-donors/:id', requireAdminAuth, async (req, res) => {
     try {
       const targetId = String(req.params.id || '').trim();
       if (!targetId) {
@@ -6654,7 +6780,7 @@ async function startServer() {
     }
   });
 
-  app.delete('/api/posts/:id', async (req, res) => {
+  app.delete('/api/posts/:id', requireAdminAuth, async (req, res) => {
     try {
       const { id } = req.params;
       if (serverSupabase) {
@@ -6781,7 +6907,7 @@ async function startServer() {
     }
   });
 
-  app.post('/api/jobs', async (req, res) => {
+  app.post('/api/jobs', requireAdminAuth, async (req, res) => {
     try {
       const jobData = req.body;
       if (!jobData || (!jobData.title && !jobData.circularUrl)) {
@@ -6832,7 +6958,7 @@ async function startServer() {
     }
   });
 
-  app.delete('/api/jobs/:id', async (req, res) => {
+  app.delete('/api/jobs/:id', requireAdminAuth, async (req, res) => {
     try {
       const { id } = req.params;
       if (serverSupabase) {
@@ -6887,7 +7013,7 @@ async function startServer() {
     createdAt: c.created_at || c.createdAt || new Date().toISOString()
   });
 
-  app.get('/api/jobs/candidates', async (req, res) => {
+  app.get('/api/jobs/candidates', requireAdminAuth, async (req, res) => {
     try {
       let candidates: any[] = [];
       if (serverSupabase) {
@@ -10072,7 +10198,7 @@ Return strict JSON:
               profession: d.profession || 'রক্তদাতা',
               available: d.is_available !== false,
               lastDonationDate: d.last_donation_date || '',
-              contactNote: formatContactActionTelLink(d.phone || '01870592699', 'Call / যোগাযোগ করুন'),
+              contactNote: formatContactActionTelLink(d.phone || PUBLIC_OFFICIAL_PHONE, 'Call / যোগাযোগ করুন'),
             }));
           }
         } catch (sErr) {
@@ -10102,7 +10228,7 @@ Return strict JSON:
                 phone: d.phone,
                 profession: d.profession || 'রক্তদাতা',
                 available: true,
-                contactNote: formatContactActionTelLink(d.phone || '01870592699', 'Call / যোগাযোগ করুন'),
+                contactNote: formatContactActionTelLink(d.phone || PUBLIC_OFFICIAL_PHONE, 'Call / যোগাযোগ করুন'),
               }));
             }
           } catch (uErr) {}
@@ -10149,7 +10275,7 @@ Return strict JSON:
               upazila: sp.upazila || '',
               rate: sp.rate_amount || sp.daily_rate || sp.rate || 'আলোচনা সাপেক্ষে',
               rating: Number(sp.rating || 5.0),
-              contactNote: formatContactActionTelLink(sp.phone || '01870592699', 'Call / যোগাযোগ করুন'),
+              contactNote: formatContactActionTelLink(sp.phone || PUBLIC_OFFICIAL_PHONE, 'Call / যোগাযোগ করুন'),
             }));
             matchType = 'provider';
           }
@@ -10176,7 +10302,7 @@ Return strict JSON:
                 upazila: sp.upazila || '',
                 rate: sp.daily_rate || sp.rate || 'আলোচনা সাপেক্ষে',
                 rating: Number(sp.rating || 4.9),
-                contactNote: formatContactActionTelLink(sp.phone || '01870592699', 'Call / যোগাযোগ করুন'),
+                contactNote: formatContactActionTelLink(sp.phone || PUBLIC_OFFICIAL_PHONE, 'Call / যোগাযোগ করুন'),
               }));
               matchType = 'provider';
             }
@@ -10204,7 +10330,7 @@ Return strict JSON:
                 upazila: sp.upazila || '',
                 rate: 'আলোচনা সাপেক্ষে',
                 rating: 4.9,
-                contactNote: formatContactActionTelLink(sp.phone || '01870592699', 'Call / যোগাযোগ করুন'),
+                contactNote: formatContactActionTelLink(sp.phone || PUBLIC_OFFICIAL_PHONE, 'Call / যোগাযোগ করুন'),
               }));
               matchType = 'provider';
             }
@@ -10585,8 +10711,8 @@ ${p.originalPrice && p.originalPrice > p.price ? `- Regular / Previous Price: ${
 - Nature & Legal Status: ${comp.legalStatus || comp.legalType || 'প্রাইভেট লিমিটেড (RJSC রেজিস্ট্রেশন প্রক্রিয়াধীন)'}
 - Mission: ${comp.mission || 'পার্বত্য চট্টগ্রামের কৃষকদের ন্যায্য মূল্য নিশ্চিতকরণ, কর্মসংস্থান ও পাহাড়ি অর্গানিক পণ্য সারাদেশে পৌঁছে দেওয়া।'}
 - Vision: ${comp.vision || comp.visionBn || 'Jhadimadi Green Revolution — পাহাড় থেকে সমতলে শতভাগ খাঁটি খাদ্য ও নির্ভরযোগ্য ডোরস্টেপ ডিজিটাল সার্ভিসের মেলবন্ধন।'}
-- Official Helpline / Phone / WhatsApp: ${cont.hotline || cont.whatsapp || '01870592699'}
-- Email: ${cont.email || 'jhadimadi2024@gmail.com'}
+- Official Helpline / Phone / WhatsApp: ${cont.hotline || cont.whatsapp || PUBLIC_OFFICIAL_PHONE}
+- Email: ${cont.email || PUBLIC_OFFICIAL_EMAIL}
 - Office Address: ${cont.officeAddress || 'খাগড়াছড়ি সদর, খাগড়াছড়ি পার্বত্য জেলা, বাংলাদেশ'}
 - Support Hours: ${cont.supportHours || cont.supportHoursBn || 'সকাল ৮:০০ - রাত ১০:০০ (প্রতিদিন, জরুরি হেল্পলাইন ২৪/৭)'}
 - Delivery Method: ${deliv.deliveryMethod || 'ক্যাশ অন ডেলিভারি (Cash on Delivery) ও হোম ডেলিভারি'}
@@ -11352,7 +11478,7 @@ Return strict JSON:
   // Dedicated Gemini Vision API NID Verification Endpoint
   const nidRateLimitStore = new Map<string, { count: number; resetTime: number }>();
 
-  app.post('/api/nid-verify-gemini', async (req, res) => {
+  app.post('/api/nid-verify-gemini', strictLimiter('nid-verify', 5, 10 * 60 * 1000), async (req, res) => {
     try {
       const { imageBase64, backImageBase64, phone, userName, selfieBase64 } = req.body;
 
@@ -11383,15 +11509,20 @@ Return strict JSON:
       const maskedPhone = phone && phone.length >= 8 ? `${phone.slice(0, 3)}****${phone.slice(-2)}` : 'Anonymous';
       console.log(`[Gemini Vision NID] Processing NID verification request for phone: ${maskedPhone}`);
 
-      // Clean base64 string and extract MIME type
+      // Validate and bound image input before forwarding to the paid AI service.
       let mimeType = 'image/jpeg';
       let cleanData = imageBase64;
-
       if (imageBase64.includes(';base64,')) {
         const parts = imageBase64.split(';base64,');
         const mimeMatch = parts[0].match(/data:(.*?);/);
         if (mimeMatch) mimeType = mimeMatch[1];
         cleanData = parts[1];
+      }
+      if (!/^image\/(jpeg|png|webp)$/i.test(mimeType)) {
+        return res.status(415).json({ success: false, message: 'শুধু JPEG, PNG বা WebP NID ছবি গ্রহণযোগ্য।' });
+      }
+      if (!/^[A-Za-z0-9+/=]+$/.test(cleanData) || Buffer.byteLength(cleanData, 'base64') > 8 * 1024 * 1024) {
+        return res.status(413).json({ success: false, message: 'NID ছবির আকার সর্বোচ্চ ৮ MB হতে হবে।' });
       }
 
       const nidVisionPrompt = `You are the internal AI-Assisted Document Screening & Forensic Anti-Fraud Analysis Engine for Jhadimadi.com.
@@ -11448,6 +11579,11 @@ Return strict JSON matching the schema.`;
               const backMimeMatch = backParts[0].match(/data:(.*?);/);
               if (backMimeMatch) backMime = backMimeMatch[1];
               cleanBack = backParts[1];
+            }
+            if (!/^image\/(jpeg|png|webp)$/i.test(backMime) ||
+                !/^[A-Za-z0-9+/=]+$/.test(cleanBack) ||
+                Buffer.byteLength(cleanBack, 'base64') > 8 * 1024 * 1024) {
+              return res.status(413).json({ success: false, message: 'NID পিছনের ছবির ফরম্যাট/আকার গ্রহণযোগ্য নয়।' });
             }
             contents.push({
               inlineData: {
@@ -11628,7 +11764,7 @@ Return strict JSON matching the schema.`;
   });
 
   // Voice Transcription Endpoint (Fallback for mobile web views & devices without native SpeechRecognition)
-  app.post('/api/voice-transcribe', async (req, res) => {
+  app.post('/api/voice-transcribe', strictLimiter('voice-transcribe', 20, 10 * 60 * 1000), async (req, res) => {
     try {
       const { audioBase64, mimeType = 'audio/webm', lang = 'bn' } = req.body;
       if (!audioBase64 || typeof audioBase64 !== 'string') {
@@ -11647,6 +11783,12 @@ Return strict JSON matching the schema.`;
         const mimeMatch = parts[0].match(/data:(.*?);/);
         if (mimeMatch) resolvedMime = mimeMatch[1];
         cleanBase64 = parts[1];
+      }
+      if (!/^audio\/(webm|wav|mpeg|mp4|ogg)$/i.test(String(resolvedMime).split(';')[0])) {
+        return res.status(415).json({ success: false, message: 'অসমর্থিত অডিও ফরম্যাট।' });
+      }
+      if (!/^[A-Za-z0-9+/=]+$/.test(cleanBase64) || Buffer.byteLength(cleanBase64, 'base64') > 5 * 1024 * 1024) {
+        return res.status(413).json({ success: false, message: 'অডিওর আকার সর্বোচ্চ ৫ MB হতে হবে।' });
       }
 
       const promptText = lang === 'bn'
