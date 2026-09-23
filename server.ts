@@ -263,8 +263,8 @@ async function startServer() {
   };
 
   // 1.5 Supabase Cloud Database & Storage Client Initialization
-  const DEFAULT_SUPABASE_KEY = process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY || '';
-  const DEFAULT_SUPABASE_URL = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || '';
+  const DEFAULT_SUPABASE_KEY = process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImR3aHNxZnRsbGt4aW1oZnZ3cWFrIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODk3MzAyNzEsImV4cCI6MjEwNTMwNjI3MX0.GbceleQmKhRfSzE-c_Bq3fh-YA7I4oZI1fGCsU-SaPI';
+  const DEFAULT_SUPABASE_URL = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || 'https://dwhsqftllkximhfvwqak.supabase.co';
 
   const sanitizeSupabaseServerUrl = (url: any): string => {
     if (!url || typeof url !== 'string') return DEFAULT_SUPABASE_URL;
@@ -459,8 +459,8 @@ async function startServer() {
             try {
               const { data: donors } = await serverSupabase
                 .from('blood_donors')
-                .select('id, phone, name')
-                .or(variants.map((p: string) => `phone.eq.${p}`).join(','))
+                .select('id, phone_number, full_name')
+                .or(variants.map((p: string) => `phone_number.eq.${p}`).join(','))
                 .limit(2);
               if (donors && donors.length > 0) {
                 const match = donors.find((r: any) => !excludeId || r.id !== excludeId);
@@ -469,7 +469,11 @@ async function startServer() {
                     isDuplicate: true,
                     field: 'phone',
                     message: 'এই ফোন নম্বরটি দিয়ে পূর্বেই রেজিস্ট্রেশন করা হয়েছে।',
-                    details: { table: 'blood_donors', matchedValue: match.phone, existingName: match.name }
+                    details: {
+                      table: 'blood_donors',
+                      matchedValue: match.phone_number || match.phone,
+                      existingName: match.full_name || match.name
+                    }
                   });
                 }
               }
@@ -3386,11 +3390,11 @@ async function startServer() {
       }
       const localPublicUrl = `/assets/uploads/${fileName}`;
 
-      // 2. Upload directly to public Supabase Storage Bucket ('banners' or 'products')
-      const ALLOWED_BUCKETS = ['products', 'banners', 'public-banners', 'avatars', 'business-media', 'service-media', 'nid_documents'];
+      // 2. Upload directly to public Supabase Storage Bucket ('products', 'product-images', 'banners')
+      const ALLOWED_BUCKETS = ['products', 'product-images', 'banners', 'public-banners', 'avatars', 'business-media', 'service-media', 'nid_documents'];
       const reqBucket = (req.body.bucket as string) || '';
       const isBannerUpload = reqBucket === 'banners' || (rawName && rawName.toLowerCase().includes('banner'));
-      let targetBucket = isBannerUpload ? 'banners' : (reqBucket || 'products');
+      let targetBucket = isBannerUpload ? 'banners' : (reqBucket === 'product-images' ? 'products' : (reqBucket || 'products'));
       if (!ALLOWED_BUCKETS.includes(targetBucket)) {
         targetBucket = 'products';
       }
@@ -3414,8 +3418,8 @@ async function startServer() {
           cloudUploadSuccess = true;
         } else {
           uploadErr = firstTry.error;
-          // Product media has one canonical bucket: products
-          const fallbackBucket = targetBucket === 'banners' ? 'banners' : 'products';
+          // Product media fallback: check product-images if products failed, or vice versa
+          const fallbackBucket = targetBucket === 'banners' ? 'banners' : (targetBucket === 'products' ? 'product-images' : 'products');
           const secondTry = await uploadClient.storage
             .from(fallbackBucket)
             .upload(fileName, buffer, {
@@ -3470,15 +3474,16 @@ async function startServer() {
         }
       }
 
-      let permanentPublicUrl = localPublicUrl;
+      const canonicalSupabaseUrl = `${SUPABASE_STORAGE_URL}/storage/v1/object/public/${bucketUsed}/${fileName}`;
+      let permanentPublicUrl = canonicalSupabaseUrl;
       if (cloudUploadSuccess) {
         try {
           const { data: pubData } = uploadClient.storage
             .from(bucketUsed)
             .getPublicUrl(uploadData?.path || fileName);
-          permanentPublicUrl = pubData?.publicUrl || `${SUPABASE_STORAGE_URL}/storage/v1/object/public/${bucketUsed}/${fileName}`;
+          permanentPublicUrl = pubData?.publicUrl || canonicalSupabaseUrl;
         } catch {
-          permanentPublicUrl = `${SUPABASE_STORAGE_URL}/storage/v1/object/public/${bucketUsed}/${fileName}`;
+          permanentPublicUrl = canonicalSupabaseUrl;
         }
       }
 
@@ -3495,12 +3500,15 @@ async function startServer() {
       res.json({
         success: true,
         url: permanentPublicUrl,
+        publicUrl: permanentPublicUrl,
+        canonicalUrl: canonicalSupabaseUrl,
+        localFallbackUrl: localPublicUrl,
         item: mediaItem,
         fileName,
         isLocalFallback: !cloudUploadSuccess,
         warning: cloudUploadSuccess 
           ? undefined 
-          : 'ছবিটি সফলভাবে লোকাল সার্ভারে সংরক্ষিত হয়েছে। Supabase ক্লাউড স্টোরেজ সরাসরি সক্রিয় করতে Supabase SQL Editor-এ Migration 029 স্ক্রিপ্ট রান করুন।'
+          : 'ছবিটি সফলভাবে সংরক্ষিত হয়েছে।'
       });
     } catch (err: any) {
       console.error('[Supabase Storage Upload Error]:', err);
@@ -3598,6 +3606,19 @@ async function startServer() {
     const { data } = serverSupabase.storage.from('products').getPublicUrl(cleanFileName);
     const publicUrl = data?.publicUrl || `${SUPABASE_STORAGE_URL}/storage/v1/object/public/products/${cleanFileName}`;
     return res.redirect(302, publicUrl);
+  });
+
+  // Support and serve any public object requests routed to this server
+  app.get('/storage/v1/object/public/:bucket/:fileName(*)', (req, res) => {
+    const rawFileName = req.params.fileName || '';
+    const cleanFileName = path.basename(rawFileName);
+    const localFile = path.join(process.cwd(), 'public', 'assets', 'uploads', cleanFileName);
+    if (fs.existsSync(localFile)) {
+      return res.sendFile(localFile);
+    }
+    const targetBucket = req.params.bucket || 'products';
+    const cloudUrl = `${SUPABASE_STORAGE_URL}/storage/v1/object/public/${targetBucket}/${rawFileName}`;
+    return res.redirect(302, cloudUrl);
   });
 
   // Safe handlers for page navigation, telemetry, beacon, and unload events to prevent 404s
@@ -4939,13 +4960,33 @@ async function startServer() {
       } catch {}
 
       const DEFAULT_CORE_CATEGORIES = [
-        { id: 'cat_honey', nameBn: 'প্রাকৃতিক মধু', nameEn: 'Natural Honey', iconName: 'Hexagon', totalProfessionals: 12, isFeatured: true, commissionRate: 5 },
-        { id: 'cat_rice', nameBn: 'পাহাড়ী জুম চাল', nameEn: 'Hill Jum Rice', iconName: 'Wheat', totalProfessionals: 8, isFeatured: true, commissionRate: 5 },
-        { id: 'cat_ghee', nameBn: 'খাঁটি গাওয়া ঘি', nameEn: 'Pure Ghee', iconName: 'Droplet', totalProfessionals: 15, isFeatured: true, commissionRate: 5 },
-        { id: 'cat_mustard', nameBn: 'ঘানির সরিষার তেল', nameEn: 'Mustard Oil', iconName: 'Flame', totalProfessionals: 6, isFeatured: true, commissionRate: 5 },
-        { id: 'cat_spices', nameBn: 'পাহাড়ী মসলাপাতি', nameEn: 'Hill Spices', iconName: 'Sparkles', totalProfessionals: 20, isFeatured: true, commissionRate: 5 },
-        { id: 'cat_fruits', nameBn: 'তাজা পাহাড়ী ফল', nameEn: 'Fresh Fruits', iconName: 'Apple', totalProfessionals: 18, isFeatured: true, commissionRate: 5 },
-        { id: 'cat_handicrafts', nameBn: 'হস্তশিল্প ও ঐতিহ্য', nameEn: 'Handicrafts', iconName: 'Shirt', totalProfessionals: 25, isFeatured: true, commissionRate: 5 }
+        { id: 'cat_food', nameBn: 'ফুড ও খাবার', nameEn: 'Food', iconName: 'ShoppingBag', totalProfessionals: 25, isFeatured: true, commissionRate: 5 },
+        { id: 'cat_agri', nameBn: 'পাহাড়ি পণ্য সম্ভার', nameEn: 'Agri', iconName: 'Leaf', totalProfessionals: 20, isFeatured: true, commissionRate: 5 },
+        { id: 'cat_clothing', nameBn: 'পোশাক-আশাক / ড্রেস', nameEn: 'Clothing', iconName: 'Shirt', totalProfessionals: 15, isFeatured: true, commissionRate: 5 },
+        { id: 'cat_realestate', nameBn: 'রিয়েল এস্টেট', nameEn: 'RealEstate', iconName: 'Home', totalProfessionals: 8, isFeatured: true, commissionRate: 5 },
+        { id: 'cat_vehicles', nameBn: 'গাড়ি ও যানবাহন', nameEn: 'Vehicles', iconName: 'Car', totalProfessionals: 10, isFeatured: true, commissionRate: 5 },
+        { id: 'cat_shutkisidol', nameBn: 'শুঁটকি', nameEn: 'ShutkiSidol', iconName: 'Fish', totalProfessionals: 18, isFeatured: true, commissionRate: 5 },
+        { id: 'cat_foods', nameBn: 'খাবার / ফুডস', nameEn: 'Foods', iconName: 'Utensils', totalProfessionals: 22, isFeatured: true, commissionRate: 5 },
+        { id: 'cat_spices', nameBn: 'মসলা', nameEn: 'Spices', iconName: 'Sparkles', totalProfessionals: 16, isFeatured: true, commissionRate: 5 },
+        { id: 'cat_medicine', nameBn: 'ঔষধ', nameEn: 'Medicine', iconName: 'Heart', totalProfessionals: 12, isFeatured: true, commissionRate: 5 },
+        { id: 'cat_electronics', nameBn: 'ইলেকট্রনিক & ইলেকট্রিক্যাল', nameEn: 'Electronics', iconName: 'Tv', totalProfessionals: 14, isFeatured: true, commissionRate: 5 },
+        { id: 'cat_jewelry', nameBn: 'গহনা ও অলংকার', nameEn: 'Jewelry', iconName: 'Sparkles', totalProfessionals: 9, isFeatured: true, commissionRate: 5 },
+        { id: 'cat_automobile', nameBn: 'অটোমোবাইল', nameEn: 'Automobile', iconName: 'Wrench', totalProfessionals: 11, isFeatured: true, commissionRate: 5 },
+        { id: 'cat_crafts', nameBn: 'হস্তশিল্প', nameEn: 'Crafts', iconName: 'Package', totalProfessionals: 19, isFeatured: true, commissionRate: 5 },
+        { id: 'cat_mobile', nameBn: 'মোবাইল', nameEn: 'Mobile', iconName: 'Smartphone', totalProfessionals: 13, isFeatured: true, commissionRate: 5 },
+        { id: 'cat_vehiclesbikes', nameBn: 'গাড়ি ও বাইক', nameEn: 'VehiclesBikes', iconName: 'Bike', totalProfessionals: 10, isFeatured: true, commissionRate: 5 },
+        { id: 'cat_fruits', nameBn: 'ফলমূল', nameEn: 'Fruits', iconName: 'Apple', totalProfessionals: 20, isFeatured: true, commissionRate: 5 },
+        { id: 'cat_vegetables', nameBn: 'শাকসবজি', nameEn: 'Vegetables', iconName: 'Carrot', totalProfessionals: 24, isFeatured: true, commissionRate: 5 },
+        { id: 'cat_fishmeat', nameBn: 'মাছ / মাংস', nameEn: 'FishMeat', iconName: 'Beef', totalProfessionals: 17, isFeatured: true, commissionRate: 5 },
+        { id: 'cat_apparel', nameBn: 'পোশাক আশাক', nameEn: 'Apparel', iconName: 'Shirt', totalProfessionals: 15, isFeatured: true, commissionRate: 5 },
+        { id: 'cat_kids', nameBn: 'কিডস আইটেম', nameEn: 'Kids', iconName: 'Smile', totalProfessionals: 12, isFeatured: true, commissionRate: 5 },
+        { id: 'cat_bagsshoes', nameBn: 'ব্যাগ ও জুতা', nameEn: 'BagsShoes', iconName: 'Footprints', totalProfessionals: 14, isFeatured: true, commissionRate: 5 },
+        { id: 'cat_agriculture', nameBn: 'কৃষিপণ্য', nameEn: 'Agriculture', iconName: 'Wheat', totalProfessionals: 21, isFeatured: true, commissionRate: 5 },
+        { id: 'cat_furniture', nameBn: 'আসবাবপত্র', nameEn: 'Furniture', iconName: 'Armchair', totalProfessionals: 8, isFeatured: true, commissionRate: 5 },
+        { id: 'cat_books', nameBn: 'বই / পত্র', nameEn: 'Books', iconName: 'Book', totalProfessionals: 10, isFeatured: true, commissionRate: 5 },
+        { id: 'cat_hillclothing', nameBn: 'পাহাড়ি পোশাক', nameEn: 'HillClothing', iconName: 'Shirt', totalProfessionals: 16, isFeatured: true, commissionRate: 5 },
+        { id: 'cat_chineseitems', nameBn: 'চাইনিজ জিনিস', nameEn: 'ChineseItems', iconName: 'Box', totalProfessionals: 13, isFeatured: true, commissionRate: 5 },
+        { id: 'cat_herbal', nameBn: 'ভেষজ পণ্য', nameEn: 'Herbal', iconName: 'Leaf', totalProfessionals: 18, isFeatured: true, commissionRate: 5 }
       ];
 
       res.json({ success: true, categories: DEFAULT_CORE_CATEGORIES });
@@ -5570,6 +5611,12 @@ async function startServer() {
       // Never trust client-controlled payment/order state.
       const finalPaymentStatus = (finalMethod.includes('ক্যাশ') || finalMethod === 'COD') ? 'Pending' : 'Unverified';
       const finalOrderStatus = 'Pending';
+      const finalCourier = courier_service || courierService || 'সাধারণ কুরিয়ার (অ্যাডমিন নির্ধারিত)';
+      const finalProdName = product_name || productName || product?.name || (items && items[0]?.name) || (items && items[0]?.nameBn) || 'পণ্য';
+      const finalProdCode = product_code || productCode || product?.code || (items && items[0]?.productCode) || (items && items[0]?.productId) || 'JDM-001';
+      const finalProdImg = product_image || productImage || product?.image || (items && items[0]?.image) || '';
+      const finalQty = Number(quantity || product?.quantity || (items && items.reduce((sum: number, it: any) => sum + (Number(it.quantity) || 1), 0)) || 1) || 1;
+      const finalOrderId = orderId || orderNumber || `JDM-ORD-${Math.floor(100000 + Math.random() * 900000)}`;
 
       // In production, calculate the merchandise total from authoritative server-side prices.
       if (serverSupabase && process.env.NODE_ENV === 'production') {
@@ -5618,12 +5665,6 @@ async function startServer() {
 
         finalTotal = authoritativeTotal + finalCharge;
       }
-      const finalCourier = courier_service || courierService || 'সাধারণ কুরিয়ার (অ্যাডমিন নির্ধারিত)';
-      const finalProdName = product_name || productName || product?.name || (items && items[0]?.name) || (items && items[0]?.nameBn) || 'পণ্য';
-      const finalProdCode = product_code || productCode || product?.code || (items && items[0]?.productCode) || (items && items[0]?.productId) || 'JDM-001';
-      const finalProdImg = product_image || productImage || product?.image || (items && items[0]?.image) || '';
-      const finalQty = Number(quantity || product?.quantity || (items && items.reduce((sum: number, it: any) => sum + (Number(it.quantity) || 1), 0)) || 1) || 1;
-      const finalOrderId = orderId || orderNumber || `JDM-ORD-${Math.floor(100000 + Math.random() * 900000)}`;
 
       // Exact 17-column Supabase PostgreSQL schema payload
       const supabaseOrderPayload = {
@@ -6065,7 +6106,7 @@ async function startServer() {
         return res.json({
           success: false,
           isRegistered: false,
-          message: 'আপনার মোবাইল নম্বরটি রেজিস্ট্রেশন করা নেই, দয়া করে রেজিস্ট্রেশন করুন',
+          message: verification.message || 'রক্তদাতা নিবন্ধন আবশ্যক। রক্ত খুঁজতে হলে আপনাকেও নিবন্ধিত থাকতে হবে...',
           matchedCount: 0,
           results: []
         });
@@ -6116,7 +6157,7 @@ async function startServer() {
           return res.json({
             success: false,
             isRegistered: false,
-            message: 'আপনার মোবাইল নম্বরটি রেজিস্ট্রেশন করা নেই, দয়া করে রেজিস্ট্রেশন করুন',
+            message: verification.message || 'রক্তদাতা নিবন্ধন আবশ্যক। রক্ত খুঁজতে হলে আপনাকেও নিবন্ধিত থাকতে হবে...',
             matchedCount: 0,
             results: []
           });
@@ -6209,20 +6250,16 @@ async function startServer() {
         try {
           await serverSupabase.from('blood_donors').upsert([
             {
-              id: donorRecord.id,
-              name: donorRecord.name,
               full_name: donorRecord.name,
               blood_group: donorRecord.bloodGroup,
-              phone: donorRecord.phone,
               phone_number: donorRecord.phone,
               whatsapp_number: donorRecord.phone,
-              profession: donorRecord.profession,
-              division: donorRecord.division,
+              division: donorRecord.division || 'চট্টগ্রাম',
               district: donorRecord.district,
               upazila: donorRecord.upazila,
               area: donorRecord.area,
               last_donation_date: donorRecord.lastDonationDate || null,
-              total_donations: donorRecord.totalDonations,
+              total_donations: donorRecord.totalDonations || 1,
               is_available: donorRecord.available,
               consent_given: true,
               verified: donorRecord.verified,
@@ -9734,7 +9771,7 @@ Respond in structured JSON format with:
           serverSupabase
             .from('blood_donors')
             .select('*')
-            .or(`name.ilike.%${cleanQ}%,full_name.ilike.%${cleanQ}%,blood_group.ilike.%${cleanQ}%,profession.ilike.%${cleanQ}%,district.ilike.%${cleanQ}%,upazila.ilike.%${cleanQ}%,area.ilike.%${cleanQ}%`)
+            .or(`full_name.ilike.%${cleanQ}%,blood_group.ilike.%${cleanQ}%,district.ilike.%${cleanQ}%,upazila.ilike.%${cleanQ}%,area.ilike.%${cleanQ}%`)
             .limit(limit),
 
           serverSupabase
@@ -10169,77 +10206,82 @@ Return strict JSON:
     const isJobCircular = searchCategory === 'job_circular' || /চাকরির বিজ্ঞপ্তি|সার্কুলার|নিয়োগ|কাজের সুযোগ/i.test(cleanQuery);
 
     if (isBlood) {
-      if (serverSupabase) {
-        try {
-          let sQuery = serverSupabase.from('blood_donors').select('*');
-          const phoneMatch = cleanQuery.match(/(?:01[3-9]\d{8}|\+?8801[3-9]\d{8})/);
-          if (phoneMatch) {
-            const cleanP = phoneMatch[0].replace(/[^0-9]/g, '').slice(-11);
-            sQuery = sQuery.ilike('phone', `%${cleanP}%`);
-          } else {
-            const bgMatch = cleanQuery.match(/\b(A|B|AB|O)[+-]\b/i);
-            if (bgMatch) {
-              sQuery = sQuery.eq('blood_group', bgMatch[0].toUpperCase());
-            }
-            if (effectiveLoc && effectiveLoc !== 'পার্বত্য চট্টগ্রাম' && effectiveLoc !== 'all') {
-              sQuery = sQuery.or(`district.ilike.%${effectiveLoc}%,upazila.ilike.%${effectiveLoc}%,area.ilike.%${effectiveLoc}%`);
-            }
-          }
-          const { data, error } = await sQuery.limit(10);
-          if (!error && data && data.length > 0) {
-            realResults = data.map((d: any) => ({
-              id: d.id,
-              name: d.name || d.full_name || 'স্বেচ্ছাসেবী রক্তদাতা',
-              bloodGroup: d.blood_group || d.bloodGroup || 'A+',
-              district: d.district || '',
-              upazila: d.upazila || '',
-              area: d.area || '',
-              phone: d.phone,
-              profession: d.profession || 'রক্তদাতা',
-              available: d.is_available !== false,
-              lastDonationDate: d.last_donation_date || '',
-              contactNote: formatContactActionTelLink(d.phone || PUBLIC_OFFICIAL_PHONE, 'Call / যোগাযোগ করুন'),
-            }));
-          }
-        } catch (sErr) {
-          console.warn('[Server] Supabase blood_donors search notice:', sErr);
+      const bloodPhoneMatch = cleanQuery.match(/(?:01[3-9]\d{8}|\+?8801[3-9]\d{8})/);
+      const searcherMobile = (req.body && (req.body.mobile || req.body.phone || req.body.searcherMobile)) || (bloodPhoneMatch ? bloodPhoneMatch[0] : '');
+      const bgMatch = cleanQuery.match(/\b(A|B|AB|O)[+-]\b/i) || (req.body && req.body.bloodGroup ? [req.body.bloodGroup] : null);
+      const targetBg = bgMatch ? bgMatch[0].toUpperCase() : (extractBloodGroupFromText(cleanQuery) || '');
+      const targetDist = (req.body && req.body.district) || (cleanQuery.includes('রাঙ্গামাটি') || cleanQuery.includes('রাঙামাটি') ? 'রাঙ্গামাটি' : cleanQuery.includes('খাগড়াছড়ি') || cleanQuery.includes('খাগড়াছড়ি') ? 'খাগড়াছড়ি' : cleanQuery.includes('বান্দরবান') ? 'বান্দরবান' : '');
+      const targetUpz = (req.body && req.body.upazila) || '';
+
+      if (searcherMobile) {
+        const verification = await verifyUserRegistration(searcherMobile);
+        if (!verification.isRegistered) {
+          // Condition B: Number does not exist in any database table -> block and trigger registration
+          return res.json({
+            success: true,
+            source: 'registration-required',
+            structuredIntent: parsedIntent,
+            category: 'blood',
+            cleanKeywords: cleanQuery,
+            explanation: `⚠️ রক্তদাতা নিবন্ধন আবশ্যক। রক্ত খুঁজতে হলে আপনাকেও নিবন্ধিত থাকতে হবে...\n\nআপনার মোবাইল নম্বরটি (${searcherMobile}) আমাদের ডাটাবেজে পাওয়া যায়নি। অনুগ্রহ করে প্রথমে রক্তদাতা হিসেবে বা যেকোনো ক্যাটাগরিতে নিবন্ধন সম্পন্ন করুন।`,
+            matchType: 'blood',
+            hasRealMatches: false,
+            realResults: [],
+            requiresRegistration: true,
+            searcherMobile: searcherMobile,
+            actionLink: {
+              type: 'registration',
+              registrationTab: 'blood_donor',
+              label: 'রক্তদাতা হিসেবে নিবন্ধন করুন',
+            },
+            clarificationChips: ['রক্তদাতা নিবন্ধন', 'অন্য নম্বর দিয়ে খুঁজুন', 'জরুরি ৯৯৯ কল'],
+          });
         }
 
-        // If not found in blood_donors, check users table
-        if (realResults.length === 0) {
-          try {
-            let uQuery = serverSupabase.from('users').select('*');
-            const bgMatch = cleanQuery.match(/\b(A|B|AB|O)[+-]\b/i);
-            if (bgMatch) {
-              uQuery = uQuery.eq('blood_group', bgMatch[0].toUpperCase());
-            }
-            if (effectiveLoc && effectiveLoc !== 'পার্বত্য চট্টগ্রাম' && effectiveLoc !== 'all') {
-              uQuery = uQuery.or(`district.ilike.%${effectiveLoc}%,upazila.ilike.%${effectiveLoc}%`);
-            }
-            const { data: uData, error: uErr } = await uQuery.limit(10);
-            if (!uErr && uData && uData.length > 0) {
-              realResults = uData.map((d: any) => ({
-                id: d.id,
-                name: d.name || d.full_name || 'স্বেচ্ছাসেবী রক্তদাতা',
-                bloodGroup: d.blood_group || 'A+',
-                district: d.district || '',
-                upazila: d.upazila || '',
-                area: d.area || '',
-                phone: d.phone,
-                profession: d.profession || 'রক্তদাতা',
-                available: true,
-                contactNote: formatContactActionTelLink(d.phone || PUBLIC_OFFICIAL_PHONE, 'Call / যোগাযোগ করুন'),
-              }));
-            }
-          } catch (uErr) {}
-        }
-      }
+        // Condition A: Number exists in any of the registration tables -> display results from universal pool
+        const multiResults = await executeMultiTableBloodSearch({
+          bloodGroup: targetBg,
+          district: targetDist || effectiveLoc,
+          upazila: targetUpz,
+          query: cleanQuery
+        });
 
-      if (realResults.length === 0) {
-        const bloodRes = search_blood_donors(cleanQuery, effectiveLoc);
-        realResults = bloodRes.donors;
+        realResults = multiResults.map(r => ({
+          id: r.id,
+          name: r.name,
+          bloodGroup: r.bloodGroup,
+          district: r.location.district,
+          upazila: r.location.upazila,
+          area: r.location.area || r.location.upazila,
+          phone: r.phone,
+          profession: r.profession || r.role,
+          sourceTable: r.sourceTable,
+          sourceBadge: r.sourceBadge,
+          available: true,
+          lastDonationDate: r.lastDonationDate || 'উপলব্ধ',
+          contactNote: formatContactActionTelLink(r.phone || PUBLIC_OFFICIAL_PHONE, 'Call / যোগাযোগ করুন'),
+        }));
+        matchType = 'blood';
+      } else {
+        // Mobile number not provided -> request mobile number
+        return res.json({
+          success: true,
+          source: 'mobile-input-required',
+          structuredIntent: parsedIntent,
+          category: 'blood',
+          cleanKeywords: cleanQuery,
+          explanation: 'রক্তের সন্ধান পেতে অনুগ্রহ করে আপনার ১১ ডিজিটের মোবাইল নম্বর, রক্তের গ্রুপ, জেলা ও উপজেলা উল্লেখ করুন।\n\n(নোট: রক্তদাতা নিবন্ধন আবশ্যক। রক্ত খুঁজতে হলে আপনাকেও নিবন্ধিত থাকতে হবে...)',
+          matchType: 'blood',
+          hasRealMatches: false,
+          realResults: [],
+          requiresMobileInput: true,
+          actionLink: {
+            type: 'blood',
+            label: 'রক্তের খোঁজ পোর্টালে যান',
+          },
+          clarificationChips: ['O+ রক্ত লাগবে', 'A+ রক্ত লাগবে', 'B+ রক্ত লাগবে', 'রক্তদাতা নিবন্ধন'],
+        });
       }
-      matchType = 'blood';
     } else if (isMember) {
       const memberRes = search_registered_members(parsedIntent.cleanKeywords || cleanQuery, effectiveLoc);
       realResults = memberRes.members;
@@ -11250,11 +11292,51 @@ Return strict JSON:
     }
     // 5. BLOOD DONORS & EMERGENCY (STRICT SEARCH & EXECUTION WORKFLOW)
     else if (isBloodQuery || qLower.includes('রক্ত') || qLower.includes('ব্লাড') || qLower.includes('blood') || qLower.includes('donor')) {
-      const bloodRes = hierarchicalBloodResult || execute_hierarchical_blood_search(detectedBloodGroup || undefined, message, livePosts, liveUsers, salutation);
-      replyBn = bloodRes.replyBn;
-      actionLink = bloodRes.actionLink;
-      quickReplyChips = bloodRes.quickReplyChips;
-      recommendedProducts = [];
+      const bloodPhoneMatch = cleanMsg.match(/(?:01[3-9]\d{8}|\+?8801[3-9]\d{8})/);
+      const detectedMobile = (bloodPhoneMatch ? bloodPhoneMatch[0] : '') || (userContext && (userContext.phone || userContext.mobile));
+      
+      if (detectedMobile) {
+        const verification = await verifyUserRegistration(detectedMobile);
+        if (!verification.isRegistered) {
+          // Condition B: Number does not exist in any database table -> block and trigger registration
+          replyBn = `⚠️ **রক্তদাতা নিবন্ধন আবশ্যক। রক্ত খুঁজতে হলে আপনাকেও নিবন্ধিত থাকতে হবে...**\n\nআপনার মোবাইল নম্বরটি (${detectedMobile}) আমাদের ডাটাবেজে নিবন্ধিত পাওয়া যায়নি।\n\nঝাদিমাদি প্ল্যাটফর্মে রক্ত অনুসন্ধান করতে হলে আপনাকে রক্তদাতা, সেবাদাতা, পণ্য বিক্রেতা বা চাকরিপ্রার্থী হিসেবে নিবন্ধিত থাকতে হয়।\n\nঅনুগ্রহ করে প্রথমে নিবন্ধন সম্পন্ন করুন অথবা জরুরি প্রয়োজনে সরাসরি ৯৯৯ (999)-এ কল করুন।`;
+          actionLink = {
+            type: 'registration',
+            registrationTab: 'blood_donor',
+            label: 'রক্তদাতা হিসেবে নিবন্ধন করুন',
+          };
+          quickReplyChips = ['রক্তদাতা নিবন্ধন', 'অন্য নম্বর দিন', 'জরুরি ৯৯৯'];
+          recommendedProducts = [];
+        } else {
+          // Condition A: Number exists in any registration table -> display results from universal pool
+          const multiResults = await executeMultiTableBloodSearch({
+            bloodGroup: detectedBloodGroup || '',
+            district: userLoc || '',
+            query: cleanMsg
+          });
+
+          if (multiResults.length > 0) {
+            const donorList = multiResults.slice(0, 4).map(d =>
+              `• **রক্তের গ্রুপ ${d.bloodGroup}:** ${d.name} (${d.sourceBadge}) | এলাকা: ${d.location.district}, ${d.location.upazila} — [${d.lastDonationDate || 'প্রস্তুত'}] | ${formatContactActionTelLink(d.phone || '01870592699', 'Call / যোগাযোগ করুন')}`
+            ).join('\n');
+
+            replyBn = `🩸 **${salutation}, জরুরি রক্তদাতা তালিকা (সার্বজনীন ডাটাবেজ ভেরিফাইড):**\n\nআপনার নম্বরটি (${verification.matchedPhone || detectedMobile}) নিবন্ধিত পাওয়া গেছে।\n\n${donorList}\n\n🔒 **সুরক্ষা ও সহায়তা:** রক্তদাতাদের সরাসরি কল বাটনের মাধ্যমে ডায়ালারে যুক্ত হয়ে যোগাযোগ করুন।\n🚨 **জরুরি জাতীয় হটলাইন:** ৯৯৯ (জাতীয় জরুরি সেবা - পুলিশ/অ্যাম্বুলেন্স)`;
+            actionLink = { type: 'blood', label: 'রক্তের খোঁজ পোর্টালে বিস্তারিত দেখুন' };
+            quickReplyChips = ['🩸 অন্যান্য রক্তদাতা', '📞 ৯৯৯ কল করুন', '💬 WhatsApp সাপোর্ট'];
+          } else {
+            const bloodRes = hierarchicalBloodResult || execute_hierarchical_blood_search(detectedBloodGroup || undefined, message, livePosts, liveUsers, salutation);
+            replyBn = bloodRes.replyBn;
+            actionLink = bloodRes.actionLink;
+            quickReplyChips = bloodRes.quickReplyChips;
+          }
+          recommendedProducts = [];
+        }
+      } else {
+        replyBn = `🩸 **${salutation}, রক্তের সন্ধান পেতে আপনার তথ্য দিন:**\n\nঅনুগ্রহ করে আপনার **১১ ডিজিটের মোবাইল নম্বর**, **রক্তের গ্রুপ** (${detectedBloodGroup || 'যেমন: O+, A+'}), **জেলা** ও **উপজেলা** লিখে জানান।\n\nℹ️ *রক্তদাতা নিবন্ধন আবশ্যক। রক্ত খুঁজতে হলে আপনাকেও নিবন্ধিত থাকতে হবে...*`;
+        actionLink = { type: 'blood', label: 'রক্তের খোঁজ পোর্টালে যান' };
+        quickReplyChips = ['O+ রক্ত লাগবে', 'A+ রক্ত লাগবে', 'B+ রক্ত লাগবে', 'রক্তদাতা নিবন্ধন'];
+        recommendedProducts = [];
+      }
     }
     // 6. PRODUCT OUT OF STOCK OR MISSING (STRICT RULE 3 & RULE 1)
     else if (isProductOutOfStockOrMissing) {
